@@ -1,25 +1,38 @@
 import asyncio
 import os
+import time
+from enum import Enum, auto
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
 from .audio import AudioCapture, AudioPlayer
-from .config import AudioConfig, GeminiConfig
+from .config import AudioConfig, GeminiConfig, WakeWordConfig
+from .wakeword import WakeWordDetector
+
+
+class AssistantState(Enum):
+    """State machine states for the voice assistant."""
+
+    LISTENING = auto()   # Waiting for wake word
+    ACTIVATED = auto()   # Wake word detected, connected to Gemini
+    RESPONDING = auto()  # Gemini is generating a response
 
 
 class VoiceAssistant:
-    """Real-time voice assistant using Gemini Live API."""
+    """Real-time voice assistant using Gemini Live API with wake word detection."""
 
     def __init__(
         self,
         audio_config: AudioConfig | None = None,
         gemini_config: GeminiConfig | None = None,
+        wakeword_config: WakeWordConfig | None = None,
     ):
         load_dotenv()
         self.audio_config = audio_config or AudioConfig()
         self.gemini_config = gemini_config or GeminiConfig()
+        self.wakeword_config = wakeword_config or WakeWordConfig()
 
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
@@ -29,11 +42,22 @@ class VoiceAssistant:
         self._capture = AudioCapture(self.audio_config)
         self._player = AudioPlayer(self.audio_config)
         self._running = False
+        self._state = AssistantState.LISTENING
+        self._last_activity_time = 0.0
+        self._wakeword_detector: WakeWordDetector | None = None
+
+        # Initialize wake word detector if enabled
+        if self.wakeword_config.enabled:
+            self._wakeword_detector = WakeWordDetector(
+                model_path=self.wakeword_config.model_path,
+                threshold=self.wakeword_config.threshold,
+                inference_framework=self.wakeword_config.inference_framework,
+            )
 
     async def _send_audio(self, session) -> None:
         """Send audio from microphone to Gemini."""
         async for chunk in self._capture.stream():
-            if not self._running:
+            if not self._running or self._state == AssistantState.LISTENING:
                 break
             await session.send(
                 input=types.LiveClientRealtimeInput(
@@ -45,39 +69,71 @@ class VoiceAssistant:
                     ]
                 )
             )
+            self._last_activity_time = time.monotonic()
 
     async def _receive_audio(self, session) -> None:
         """Receive and play audio from Gemini."""
-        while self._running:
+        while self._running and self._state != AssistantState.LISTENING:
             try:
                 async for response in session.receive():
-                    if not self._running:
+                    if not self._running or self._state == AssistantState.LISTENING:
                         break
 
                     server_content = response.server_content
                     if server_content:
                         if server_content.model_turn:
+                            self._state = AssistantState.RESPONDING
                             for part in server_content.model_turn.parts:
                                 if part.inline_data:
                                     self._player.play_sync(part.inline_data.data)
 
                         if server_content.turn_complete:
-                            pass  # Turn completed, ready for next input
+                            self._state = AssistantState.ACTIVATED
+                            self._last_activity_time = time.monotonic()
 
             except Exception as e:
                 if self._running:
                     print(f"Receive error: {e}")
                 break
 
-    async def run(self) -> None:
-        """Start the voice assistant."""
-        print("Starting voice assistant...")
-        print(f"Model: {self.gemini_config.model}")
-        print("Speak into your microphone. Press Ctrl+C to exit.\n")
+    async def _check_timeout(self) -> None:
+        """Check for inactivity timeout and return to listening state."""
+        while self._running and self._state != AssistantState.LISTENING:
+            await asyncio.sleep(1.0)
+            if self._state == AssistantState.ACTIVATED:
+                elapsed = time.monotonic() - self._last_activity_time
+                if elapsed >= self.wakeword_config.timeout:
+                    print("\nTimeout - returning to wake word listening...")
+                    self._state = AssistantState.LISTENING
+                    break
 
-        self._running = True
-        self._capture.start()
-        self._player.start()
+    async def _listen_for_wakeword(self) -> bool:
+        """Listen for wake word and return True when detected.
+
+        Returns:
+            True if wake word detected, False if assistant is shutting down.
+        """
+        if not self._wakeword_detector:
+            return True  # Wake word disabled, proceed immediately
+
+        print("Listening for wake word...")
+        self._wakeword_detector.reset()
+
+        async for chunk in self._capture.stream():
+            if not self._running:
+                return False
+
+            detected = self._wakeword_detector.process_audio(chunk)
+            if detected:
+                print(f"\nWake word '{detected}' detected!")
+                return True
+
+        return False
+
+    async def _run_session(self) -> None:
+        """Run a single Gemini session after wake word detection."""
+        self._state = AssistantState.ACTIVATED
+        self._last_activity_time = time.monotonic()
 
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -91,12 +147,50 @@ class VoiceAssistant:
                 model=self.gemini_config.model,
                 config=config,
             ) as session:
-                print("Connected to Gemini. Listening...\n")
+                print("Connected to Gemini. Listening for your question...\n")
 
                 send_task = asyncio.create_task(self._send_audio(session))
                 receive_task = asyncio.create_task(self._receive_audio(session))
+                timeout_task = asyncio.create_task(self._check_timeout())
 
-                await asyncio.gather(send_task, receive_task)
+                # Wait until we return to listening state or shutdown
+                await asyncio.gather(send_task, receive_task, timeout_task)
+
+        except Exception as e:
+            print(f"Session error: {e}")
+
+        self._state = AssistantState.LISTENING
+
+    async def run(self) -> None:
+        """Start the voice assistant with wake word detection."""
+        if self.wakeword_config.enabled:
+            print("Starting voice assistant with wake word detection...")
+            print(f"Wake word model: {self._wakeword_detector.model_names}")
+            print(f"Threshold: {self.wakeword_config.threshold}")
+            print(f"Timeout: {self.wakeword_config.timeout}s")
+        else:
+            print("Starting voice assistant (wake word disabled)...")
+        print(f"Model: {self.gemini_config.model}")
+        print("Press Ctrl+C to exit.\n")
+
+        self._running = True
+        self._capture.start()
+        self._player.start()
+
+        try:
+            while self._running:
+                if self.wakeword_config.enabled:
+                    # Wait for wake word
+                    detected = await self._listen_for_wakeword()
+                    if not detected:
+                        break
+
+                # Run Gemini session
+                await self._run_session()
+
+                if not self.wakeword_config.enabled:
+                    # If wake word disabled, only run one session
+                    break
 
         except Exception as e:
             print(f"Error: {e}")
@@ -109,5 +203,6 @@ class VoiceAssistant:
             return
         print("\nShutting down...")
         self._running = False
+        self._state = AssistantState.LISTENING
         self._capture.stop()
         self._player.stop()

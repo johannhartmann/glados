@@ -1,6 +1,14 @@
 """Voice assistant using Gemini Live API."""
 
-from .assistant import VoiceAssistant
-from .config import AudioConfig, GeminiConfig
+from .assistant import AssistantState, VoiceAssistant
+from .config import AudioConfig, GeminiConfig, WakeWordConfig
+from .wakeword import WakeWordDetector
 
-__all__ = ["VoiceAssistant", "AudioConfig", "GeminiConfig"]
+__all__ = [
+    "AssistantState",
+    "AudioConfig",
+    "GeminiConfig",
+    "VoiceAssistant",
+    "WakeWordConfig",
+    "WakeWordDetector",
+]

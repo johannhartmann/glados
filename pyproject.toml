@@ -5,9 +5,15 @@ description = "Real-time voice assistant using Gemini Live API"
 requires-python = ">=3.10"
 dependencies = [
     "google-genai>=1.0.0",
+    "openwakeword>=0.6.0",
     "pyaudio>=0.2.14",
     "python-dotenv>=1.0.0",
 ]
+
+[tool.uv]
+# openwakeword requires tflite-runtime on Linux which doesn't support Python 3.13
+# Override to skip tflite-runtime since we only use ONNX inference
+override-dependencies = ["tflite-runtime ; python_version < '0'"]
 
 [project.scripts]
 voice-assistant = "voice_assistant.__main__:main"

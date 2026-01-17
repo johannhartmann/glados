@@ -19,3 +19,13 @@ class GeminiConfig:
     """Configuration for Gemini Live API."""
     model: str = "gemini-2.5-flash-native-audio-preview-12-2025"
     system_instruction: str = "You are a helpful, friendly voice assistant."
+
+
+@dataclass
+class WakeWordConfig:
+    """Configuration for wake word detection."""
+    enabled: bool = True                  # Enable/disable wake word detection
+    model_path: str | None = None         # Path to custom model, None = "hey_jarvis"
+    threshold: float = 0.5                # Detection confidence threshold (0.0-1.0)
+    timeout: float = 30.0                 # Seconds of silence before returning to listening
+    inference_framework: str = "onnx"     # "onnx" or "tflite"
